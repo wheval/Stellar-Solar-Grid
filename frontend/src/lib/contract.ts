@@ -1,85 +1,349 @@
 import * as StellarSdk from "@stellar/stellar-sdk";
 import { useWalletStore } from "@/store/walletStore";
-
-const RPC_URL = process.env.NEXT_PUBLIC_RPC_URL!;
-const CONTRACT_ID = process.env.NEXT_PUBLIC_CONTRACT_ID!;
-const NETWORK_PASSPHRASE = process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE!;
-
-const server = new StellarSdk.SorobanRpc.Server(RPC_URL);
+import { env } from "@/lib/env";
+import { padResourceFee as padFee } from "@/lib/fees";
 
 export interface MeterData {
+  version: number;
   owner: string;
   active: boolean;
-  balance: bigint;
   units_used: bigint;
   plan: string;
   last_payment: bigint;
+  expires_at: bigint;
+  balance: bigint;
+  grace_expires_at?: bigint | null;
+  meter_id?: string;
+  /** Max stroops deductible per day; 0 = unlimited (closes #758). */
+  daily_limit?: bigint;
+  /** Stroops spent in the current daily window (closes #758). */
+  day_spent?: bigint;
+  /** True (default) if exceeding daily_limit blocks usage; false = warn only. */
+  auto_deactivate?: boolean;
 }
 
-export async function fetchMeter(meterId: string): Promise<MeterData> {
-  const contract = new StellarSdk.Contract(CONTRACT_ID);
-  // Use a throwaway keypair for read-only simulation
-  const keypair = StellarSdk.Keypair.random();
-  const account = new StellarSdk.Account(keypair.publicKey(), "0");
-
-  const tx = new StellarSdk.TransactionBuilder(account, {
-    fee: "100",
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(
-      contract.call(
-        "get_meter",
-        StellarSdk.nativeToScVal(meterId, { type: "symbol" })
-      )
-    )
-    .setTimeout(30)
-    .build();
-
-  const sim = await server.simulateTransaction(tx);
-  if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
-    throw new Error(sim.error);
-  }
-  const retval = (sim as StellarSdk.SorobanRpc.Api.SimulateTransactionSuccessResponse).result?.retval;
-  if (!retval) throw new Error("No result from contract");
-  return StellarSdk.scValToNative(retval) as MeterData;
-}
+const REQUEST_TIMEOUT_MS = env.NEXT_PUBLIC_REQUEST_TIMEOUT_MS;
 
 /**
- * Build, simulate, sign (via connected wallet), and submit a contract call.
- * Throws raw errors — callers should wrap with parseWalletError().
+ * #762 — Pad the assembled transaction fee (classic fee + simulated resource
+ * fee) by a safety margin before the wallet signs it. `simulateTransaction`'s
+ * resource-fee estimate is a point-in-time snapshot; actual cost can drift
+ * by submission time, and that drift scales with how many ledger entries the
+ * operation touches — a fixed percentage margin therefore scales with it too.
+ * Mirrors backend/src/lib/stellar.ts's padResourceFee.
  */
+export function padResourceFee(assembledFee: string): string {
+  return padFee(assembledFee, env.NEXT_PUBLIC_FEE_SAFETY_MARGIN_PCT);
+}
+
+export class ContractClient {
+  private server: StellarSdk.SorobanRpc.Server;
+  private contractId: string;
+  private networkPassphrase: string;
+
+  constructor(contractId: string, rpcUrl: string, networkPassphrase: string) {
+    this.server = new StellarSdk.SorobanRpc.Server(rpcUrl);
+    this.contractId = contractId;
+    this.networkPassphrase = networkPassphrase;
+  }
+
+  private async withTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
+  ): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+  }
+
+  async query(method: string, args: StellarSdk.xdr.ScVal[]): Promise<StellarSdk.xdr.ScVal> {
+    const contract = new StellarSdk.Contract(this.contractId);
+    const keypair = StellarSdk.Keypair.random();
+    const account = new StellarSdk.Account(keypair.publicKey(), "0");
+
+    const tx = new StellarSdk.TransactionBuilder(account, {
+      fee: "100",
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    const sim = await this.withTimeout(this.server.simulateTransaction(tx));
+    if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
+      throw new Error(sim.error);
+    }
+    const retval = (sim as StellarSdk.SorobanRpc.Api.SimulateTransactionSuccessResponse).result
+      ?.retval;
+    if (!retval) throw new Error(`No result from ${method}`);
+    return retval;
+  }
+
+  async invoke(
+    sourceAddress: string,
+    method: string,
+    args: StellarSdk.xdr.ScVal[],
+  ): Promise<string> {
+    const contract = new StellarSdk.Contract(this.contractId);
+    const account = await this.withTimeout(this.server.getAccount(sourceAddress));
+
+    let tx = new StellarSdk.TransactionBuilder(account, {
+      fee: "100",
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    const sim = await this.withTimeout(this.server.simulateTransaction(tx));
+    if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
+      throw new Error(sim.error);
+    }
+
+    tx = StellarSdk.SorobanRpc.assembleTransaction(tx, sim).build();
+    const paddedFee = padResourceFee(tx.fee);
+    if (paddedFee !== tx.fee) {
+      tx = StellarSdk.TransactionBuilder.cloneFrom(tx, { fee: paddedFee }).build();
+    }
+
+    const { signTransaction } = useWalletStore.getState();
+    const signedXdr = await signTransaction(tx.toXDR());
+
+    const signedTx = StellarSdk.TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+    const result = await this.withTimeout(this.server.sendTransaction(signedTx));
+
+    if (result.status === "ERROR") {
+      throw new Error(`Transaction failed: ${result.errorResult}`);
+    }
+    return result.hash;
+  }
+}
+
+export const client = new ContractClient(
+  env.NEXT_PUBLIC_CONTRACT_ID,
+  env.NEXT_PUBLIC_RPC_URL,
+  env.NEXT_PUBLIC_NETWORK_PASSPHRASE,
+);
+
+export async function fetchMeter(meterId: string): Promise<MeterData> {
+  const retval = await client.query("get_meter_full", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+  ]);
+  const view = StellarSdk.scValToNative(retval) as {
+    meter: Omit<MeterData, "balance">;
+    balance: bigint;
+  };
+  return { ...view.meter, balance: view.balance } as MeterData;
+}
+
 export async function contractInvoke(
   sourceAddress: string,
   method: string,
-  args: StellarSdk.xdr.ScVal[]
+  args: StellarSdk.xdr.ScVal[],
 ): Promise<string> {
-  const contract = new StellarSdk.Contract(CONTRACT_ID);
-  const account = await server.getAccount(sourceAddress);
+  return client.invoke(sourceAddress, method, args);
+}
 
-  let tx = new StellarSdk.TransactionBuilder(account, {
-    fee: "100",
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call(method, ...args))
-    .setTimeout(30)
-    .build();
+export async function fetchMetersByOwner(ownerAddress: string): Promise<string[]> {
+  const retval = await client.query("get_meters_by_owner", [
+    StellarSdk.nativeToScVal(ownerAddress, { type: "address" }),
+  ]);
+  return StellarSdk.scValToNative(retval) as string[];
+}
 
-  const sim = await server.simulateTransaction(tx);
-  if (StellarSdk.SorobanRpc.Api.isSimulationError(sim)) {
-    throw new Error(sim.error);
+export async function checkMeterAccess(meterId: string): Promise<boolean> {
+  const retval = await client.query("check_access", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+  ]);
+  return StellarSdk.scValToNative(retval) as boolean;
+}
+
+/** Read the contract-wide emergency pause state for the global banner. */
+export async function isContractPaused(): Promise<boolean> {
+  const retval = await client.query("is_paused", []);
+  return StellarSdk.scValToNative(retval) as boolean;
+}
+
+export async function fetchAllMeters(): Promise<MeterData[]> {
+  const allMeters: MeterData[] = [];
+  const pageSize = 50; // Fetch 50 meters per page to respect Soroban read limits
+  let offset = 0;
+  let hasMore = true;
+
+  while (hasMore) {
+    try {
+      const pageIds = await fetchMetersPaginated(offset, pageSize);
+      if (pageIds.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      // Fetch full meter details for each ID on this page
+      const pageMeters = await Promise.all(
+        pageIds.map(async (meterId) => {
+          try {
+            const meter = await fetchMeter(meterId);
+            return meter;
+          } catch (error) {
+            console.warn(`Failed to fetch meter ${meterId}:`, error);
+            return null;
+          }
+        }),
+      );
+
+      // Filter out failed fetches and add to results
+      const validMeters = pageMeters.filter((m) => m !== null) as MeterData[];
+      allMeters.push(...validMeters);
+
+      // Check if we got less than a full page (means we reached the end)
+      if (pageIds.length < pageSize) {
+        hasMore = false;
+      }
+
+      offset += pageSize;
+    } catch (error) {
+      console.error("Error fetching meters page:", error);
+      hasMore = false;
+    }
   }
 
-  tx = StellarSdk.SorobanRpc.assembleTransaction(tx, sim).build();
+  return allMeters;
+}
 
-  // Sign via wallet (Freighter rejection throws here)
-  const { signTransaction } = useWalletStore.getState();
-  const signedXdr = await signTransaction(tx.toXDR());
+export async function fetchMetersPaginated(offset: number, limit: number): Promise<string[]> {
+  const retval = await client.query("get_all_meters_paginated", [
+    StellarSdk.nativeToScVal(offset, { type: "u32" }),
+    StellarSdk.nativeToScVal(limit, { type: "u32" }),
+  ]);
+  return StellarSdk.scValToNative(retval) as string[];
+}
 
-  const signedTx = StellarSdk.TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
-  const result = await server.sendTransaction(signedTx);
+export async function transferMeterOwnership(
+  sourceAddress: string,
+  meterId: string,
+  newOwnerAddress: string,
+): Promise<string> {
+  return contractInvoke(sourceAddress, "transfer_meter_ownership", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+    StellarSdk.nativeToScVal(newOwnerAddress, { type: "address" }),
+  ]);
+}
 
-  if (result.status === "ERROR") {
-    throw new Error(`Transaction failed: ${result.errorResult}`);
-  }
-  return result.hash;
+// ── Energy token staking (#899) ─────────────────────────────────────────────
+
+const addrVal = (a: string) => StellarSdk.nativeToScVal(a, { type: "address" });
+const i128Val = (v: bigint) => StellarSdk.nativeToScVal(v, { type: "i128" });
+
+/** Stake `amount` (base units, 7 decimals) of the energy token. */
+export function stakeTokens(staker: string, amount: bigint): Promise<string> {
+  return contractInvoke(staker, "stake", [addrVal(staker), i128Val(amount)]);
+}
+
+/** Start the unstake cooldown for `amount`. */
+export function requestUnstake(staker: string, amount: bigint): Promise<string> {
+  return contractInvoke(staker, "request_unstake", [addrVal(staker), i128Val(amount)]);
+}
+
+/** Withdraw tokens whose cooldown has elapsed. */
+export function withdrawUnstaked(staker: string): Promise<string> {
+  return contractInvoke(staker, "withdraw_unstaked", [addrVal(staker)]);
+}
+
+/** Put cooling-down tokens back into the active stake. */
+export function cancelUnstake(staker: string): Promise<string> {
+  return contractInvoke(staker, "cancel_unstake", [addrVal(staker)]);
+}
+
+/** Claim all accrued staking rewards. */
+export function claimStakingRewards(staker: string): Promise<string> {
+  return contractInvoke(staker, "claim_staking_rewards", [addrVal(staker)]);
+}
+
+// ── Family/household account delegation (#981) ──────────────────────────────
+
+/** Permission level granted to a delegate. */
+export type DelegatePermission = "view" | "pay" | "admin";
+
+export interface Delegate {
+  delegated_address: string;
+  permissions: DelegatePermission;
+  expiry: bigint;
+}
+
+/** List the delegates granted access to `meterId`. */
+export async function fetchDelegates(meterId: string): Promise<Delegate[]> {
+  const retval = await client.query("get_delegates", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+  ]);
+  return StellarSdk.scValToNative(retval) as Delegate[];
+}
+
+/** Owner-only: grant `delegate` access to `meterId` until `expiry`. */
+export function addDelegate(
+  sourceAddress: string,
+  meterId: string,
+  delegate: string,
+  permissions: DelegatePermission,
+  expiry: bigint,
+): Promise<string> {
+  return contractInvoke(sourceAddress, "add_delegate", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+    addrVal(delegate),
+    StellarSdk.nativeToScVal(permissions, { type: "symbol" }),
+    StellarSdk.nativeToScVal(expiry, { type: "u64" }),
+  ]);
+}
+
+/** Owner-only: revoke `delegate`'s access to `meterId`. */
+export function removeDelegate(
+  sourceAddress: string,
+  meterId: string,
+  delegate: string,
+): Promise<string> {
+  return contractInvoke(sourceAddress, "remove_delegate", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+    addrVal(delegate),
+  ]);
+}
+
+/** Make a payment on `meterId` using a delegate's pay permission. */
+export function makeDelegatedPayment(
+  sourceAddress: string,
+  meterId: string,
+  delegate: string,
+  amountStroops: bigint,
+  plan: string,
+  memo: string,
+): Promise<string> {
+  return contractInvoke(sourceAddress, "make_delegated_payment", [
+    StellarSdk.nativeToScVal(meterId, { type: "symbol" }),
+    addrVal(delegate),
+    i128Val(amountStroops),
+    StellarSdk.nativeToScVal(plan, { type: "symbol" }),
+    StellarSdk.nativeToScVal(memo, { type: "symbol" }),
+  ]);
+}
+
+// ── Seasonal pricing plans (#992) ───────────────────────────────────────────
+
+export interface SeasonalRate {
+  season: string;
+  start_date: bigint;
+  end_date: bigint;
+  multiplier: bigint;
+}
+
+/** Fetch all configured seasonal rates. */
+export async function fetchSeasonalRates(): Promise<SeasonalRate[]> {
+  const retval = await client.query("get_seasonal_rates", []);
+  return StellarSdk.scValToNative(retval) as SeasonalRate[];
+}
+
+/** Fetch the season currently in effect (and its rate). */
+export async function fetchCurrentSeason(): Promise<SeasonalRate> {
+  const retval = await client.query("get_current_season", []);
+  return StellarSdk.scValToNative(retval) as SeasonalRate;
 }
